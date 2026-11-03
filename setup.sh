@@ -34,13 +34,26 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+probe_body() {  # probe_body <port> <password>，直接吐出响应体
+  curl -s --noproxy '*' -m 5 -H "Authorization: Bearer $2" \
+    "http://127.0.0.1:$1/api/v1/health" 2>/dev/null
+}
+
+# 防呆：文档里的 <端口> / <口令> 只是占位符，照抄会变成 shell 重定向而报
+# "syntax error near unexpected token `newline'"。提前拦下来，说人话。
+case "$ARG_PORT$ARG_PW" in
+  *"<"*|*">"*)
+    echo "参数里还留着尖括号。<端口> / <口令> 只是占位符，请换成真实值，例如：" >&2
+    echo "  ./setup.sh --port 62044 --password 你的口令" >&2
+    exit 2 ;;
+esac
+
 probe() {  # probe <port> <password>，0 表示可用
   # 判定要点：必须同时出现 "status":"ok" 和 "platforms"。
   # 只看 status 会把适配层自己的 /health 也认成网关（它同样返回 status:ok），
   # 那样扫端口时会误命中 8100 端口。
   local h
-  h=$(curl -s --noproxy '*' -m 5 -H "Authorization: Bearer $2" \
-        "http://127.0.0.1:$1/api/v1/health" 2>/dev/null)
+  h=$(probe_body "$1" "$2")
   [[ "$h" == *'"status":"ok"'* && "$h" == *'"platforms"'* ]]
 }
 
@@ -71,23 +84,42 @@ if [[ -n "${CODEBUDDY_GATEWAY_PASSWORD:-}" && -n "${CODEBUDDY_GATEWAY_PORT:-}" ]
   echo "提示：环境变量里的口令探测失败，继续尝试其它来源。" >&2
 fi
 
-# ---------- 3. 旧口令 + 扫端口（日常最常用） ----------
-# 实测结论：WorkBuddy 重启后端口会变（例如 52436 → 64654），但口令不变。
-# 所以拿 .gateway.json 里已有的口令，去探当前所有本地监听端口，命中即更新端口。
-# 这一步让"重启后必须先手动改配置"变成自动恢复。
+# ---------- 3. 旧口令 + 扫端口（日常最常用，带重试） ----------
+# 实测结论：WorkBuddy 每次重启端口都会变（52436 → 64654 → 62044），但口令不变。
+# 所以拿 .gateway.json 里已有的口令，去探当前所有回环监听端口，命中即更新端口。
+#
+# 为什么必须重试：重启那一刻网关还没监听，一次扫不到是正常现象，
+# uptime 可能只有几十秒。一次就放弃会让用户误以为"配置坏了"。
+scan_ports() {
+  lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null \
+    | awk '$9 ~ /^127\.0\.0\.1:[0-9]+$/ {split($9,a,":"); print a[2]}' | sort -un
+}
+
+OLD_PW=""
 if [[ -f "$OUT" ]]; then
   OLD_PW=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('password',''))" "$OUT" 2>/dev/null)
-  if [[ -n "$OLD_PW" ]]; then
-    SCAN_PORTS=$(lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null \
-      | awk '$9 ~ /^127\.0\.0\.1:[0-9]+$/ {split($9,a,":"); print a[2]}' | sort -un)
-    for p in $SCAN_PORTS; do
+fi
+
+AUTH_SEEN=""   # 扫到"像网关但口令不对"的端口时记下来，用于区分失败原因
+
+if [[ -n "$OLD_PW" ]]; then
+  ROUNDS="${SETUP_ROUNDS:-6}"
+  for r in $(seq 1 "$ROUNDS"); do
+    for p in $(scan_ports); do
       if probe "$p" "$OLD_PW"; then
         save "$p" "$OLD_PW"
         echo "   （旧口令在新端口上有效，端口已自动更新）"
         exit 0
       fi
+      body=$(probe_body "$p" "$OLD_PW")
+      [[ "$body" == *'AUTH_REQUIRED'* ]] && AUTH_SEEN="$AUTH_SEEN $p"
     done
-  fi
+    if [[ "$r" -lt "$ROUNDS" ]]; then
+      printf '   第 %s/%s 轮没扫到可用网关，5 秒后重试（WorkBuddy 重启后网关要几十秒才起来）…\n' \
+        "$r" "$ROUNDS"
+      sleep 5
+    fi
+  done
 fi
 
 # ---------- 4. 从进程环境读 ----------
@@ -117,18 +149,31 @@ for pid in $PIDS; do
   done
 done
 
-# ---------- 失败：给出可执行的下一步 ----------
+# ---------- 失败：分两种情形，各给可照抄的命令 ----------
 echo >&2
-echo "自动获取失败。你的网关可能是内嵌在桌面端里的，进程环境里拿不到口令。" >&2
-echo "请手动指定一次：" >&2
-echo >&2
-echo "  1) 找端口：" >&2
-echo "     lsof -nP -iTCP -sTCP:LISTEN | grep -i workbuddy" >&2
-echo >&2
-echo "  2) 找口令（二选一）：" >&2
-echo "     - 如果之前已经配好过，沿用 .gateway.json 里的旧值" >&2
-echo "     - 或从 WorkBuddy 内置网关启动时打印的 Password 行获取" >&2
-echo >&2
-echo "  3) 写入：" >&2
-echo "     ./setup.sh --port <端口> --password <口令>" >&2
+if [[ -n "$AUTH_SEEN" ]]; then
+  # 扫到了网关，但口令被拒 —— 说明口令轮换了（WorkBuddy 升级或重新登录后少见地会出现）
+  echo "找到 WorkBuddy 网关（端口${AUTH_SEEN}），但 .gateway.json 里的口令已被拒绝。" >&2
+  echo "说明口令轮换了，需要你从桌面端取一次新口令：" >&2
+  echo >&2
+  echo "  1) 在 WorkBuddy 里随便发一条消息，让网关打印出带 Password 的启动信息" >&2
+  echo "  2) 用新口令写入（把下面两个值换成你自己的，不要带尖括号）：" >&2
+  echo "     ./setup.sh --port 62044 --password 这里填你的新口令" >&2
+  echo >&2
+  echo "  现在扫到的网关端口是：$(echo $AUTH_SEEN)" >&2
+else
+  # 完全没扫到网关 —— 这才是最常见的情形
+  echo "没扫到 WorkBuddy 网关。这通常不是配置问题，是网关此刻没在监听。" >&2
+  echo >&2
+  echo "  最常见的原因（按概率排序）：" >&2
+  echo "    1. WorkBuddy 刚重启过，网关要几十秒才起来 —— 等半分钟直接重跑 ./setup.sh" >&2
+  echo "    2. WorkBuddy 开着但没有活动的对话窗口 —— 点开任意一个对话" >&2
+  echo "    3. WorkBuddy 根本没开 —— 先启动它" >&2
+  echo >&2
+  echo "  想确认网关到底在不在，用这条（网关进程名是 Electron，不是 WorkBuddy，所以按名字 grep 是空的）：" >&2
+  echo "     lsof -nP -iTCP -sTCP:LISTEN | grep -iE 'electron|workbuddy'" >&2
+  echo >&2
+  echo "  想让它等更久再放弃（例如 30 轮 ≈ 2.5 分钟）：" >&2
+  echo "     SETUP_ROUNDS=30 ./setup.sh" >&2
+fi
 exit 1

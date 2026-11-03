@@ -76,11 +76,20 @@ cd workbuddy-openai-bridge
 OK 已写入 /path/to/workbuddy-openai-bridge/.gateway.json, 端口 52436
 ```
 
-如果提示需要手动指定（有些版本的网关内嵌在桌面端里，进程环境读不到口令），按提示做一次：
+绝大多数情况到这一步就结束了。脚本会自己处理三件麻烦事：
+
+1. **重启后端口变了** —— 用已有口令扫一遍本地监听端口，命中就自动改写端口（会重试 6 轮约 30 秒，因为网关在 WorkBuddy 重启后要几十秒才起来）
+2. **扫描时不会误伤自己** —— 适配层的 `/health` 也返回 `ok`，脚本靠响应里有没有 `platforms` 字段区分
+3. **等不及可以加长** —— `SETUP_ROUNDS=30 ./setup.sh` 会等约 2.5 分钟
+
+只有在**新机器第一次用**，或者**口令被轮换**时，才需要手动给一次：
 
 ```bash
-lsof -nP -iTCP -sTCP:LISTEN | grep -i workbuddy     # 找端口
-./setup.sh --port 52436 --password <口令>           # 写入
+# 找端口（注意：网关进程名是 Electron，不是 WorkBuddy，按名字 grep 是空的）
+lsof -nP -iTCP -sTCP:LISTEN | grep -iE 'electron|workbuddy'
+
+# 写入（换成本机的真实端口和口令，不要带尖括号）
+./setup.sh --port 62044 --password 你的口令
 ```
 
 口令我拿不到也不该拿到，它在你机器上，只有你自己能取。
