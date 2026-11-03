@@ -97,14 +97,24 @@ lsof -nP -iTCP -sTCP:LISTEN | grep -iE 'electron|workbuddy'
 ### 第三步：启动适配层
 
 ```bash
-python3 server.py --port 8100
+./start.sh -d        # 后台运行，日志写 bridge.log
+# 或 ./start.sh      # 前台运行，Ctrl+C 停止
 ```
 
 看到这行就成功了：
 
 ```
-OpenAI 兼容接口已启动：http://127.0.0.1:8100/v1
-  base_url = http://127.0.0.1:8100/v1    model = workbuddy-agent
+后台已启动：pid 12345，日志 /path/to/workbuddy-openai-bridge/bridge.log
+```
+
+> **为什么必须这样跑**：适配层要常驻，外部工具随时会来请求。用别的方式临时拉起（比如让某个 AI 会话代跑），进程很容易随会话结束被回收——症状是外部工具报一句莫名的 `Failed to fetch`。`start.sh` 启动的进程挂在你自己的终端下，不受影响。
+
+日常管理：
+
+```bash
+./start.sh status    # 在不在跑
+./start.sh stop      # 停止
+tail -f bridge.log   # 看请求日志
 ```
 
 ### 验证
@@ -215,9 +225,11 @@ OpenAI 协议里每轮都会带完整历史，但这个网关不支持「传入�
 | 文件 | 作用 |
 |---|---|
 | `server.py` | 适配层本体，OpenAI 兼容接口 |
+| `start.sh` | 启停脚本（前台 / 后台 / 停止 / 状态） |
 | `setup.sh` | 找网关端口与口令，写入 `.gateway.json`（含重启后的端口自动发现） |
 | `check.sh` | 只读体检，不调用模型 |
 | `.gateway.json` | 运行时生成的凭据文件，**已在 .gitignore 里** |
+| `.bridge.pid` | `start.sh -d` 的进程号，已在 .gitignore 里 |
 
 服务端的接口：
 
