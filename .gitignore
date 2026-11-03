@@ -1,0 +1,7 @@
+# 本地网关凭据，含 Bearer 口令，绝对不要提交
+.gateway.json
+
+# 运行产物
+*.log
+__pycache__/
+.DS_Store
