@@ -25,10 +25,13 @@ OUT="$HERE/.gateway.json"
 
 ARG_PORT=""
 ARG_PW=""
+WANT_LIST=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --port) ARG_PORT="${2:-}"; shift 2 ;;
     --password) ARG_PW="${2:-}"; shift 2 ;;
+    --switch) SWITCH_PORT="${2:-}"; shift 2 ;;
+    --list) WANT_LIST=1; shift ;;
     -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
     *) echo "未知参数：$1" >&2; exit 2 ;;
   esac
@@ -69,6 +72,35 @@ listen_ports() {  # listen_ports <pid>
     | sed -n 's/.*:\([0-9]\{2,\}\) (LISTEN).*/\1/p'
 }
 
+list_gateways() {  # 列出所有活着的网关，附带它绑定的那个对话
+  local pw="$1" found=0
+  echo "活着的网关（一个窗口一个网关，关掉窗口网关就消失）："
+  echo
+  for p in $(scan_ports); do
+    [[ "$(probe_body "$p" "$pw")" == *'"platforms"'* ]] || continue
+    found=1
+    local info
+    info=$(curl -s --noproxy '*' -m 4 -H "Authorization: Bearer $pw" \
+             "http://127.0.0.1:$p/api/v1/sessions" 2>/dev/null \
+           | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin).get('data', {}).get('sessions', [])
+except Exception:
+    d = []
+if d:
+    s = d[0]
+    print('%s（%s 条消息）' % (s.get('name', '未命名'), s.get('messageCount', '?')))
+else:
+    print('（还没有对话）')
+" 2>/dev/null)
+    printf '  %-6s %s\n' "$p" "${info:-（读不到会话）}"
+  done
+  [[ "$found" -eq 0 ]] && echo "  （没有）"
+  echo
+  echo "选定一个端口后：./setup.sh --port <那个端口> --password <口令>"
+}
+
 # ---------- 1. 显式参数 ----------
 if [[ -n "$ARG_PORT" && -n "$ARG_PW" ]]; then
   if probe "$ARG_PORT" "$ARG_PW"; then save "$ARG_PORT" "$ARG_PW"; exit 0; fi
@@ -101,6 +133,32 @@ if [[ -f "$OUT" ]]; then
 fi
 
 AUTH_SEEN=""   # 扫到"像网关但口令不对"的端口时记下来，用于区分失败原因
+
+# ---------- --switch：切换到这个窗口（口令沿用，不用手抄） ----------
+if [[ -n "${SWITCH_PORT:-}" ]]; then
+  if [[ -z "$OLD_PW" ]]; then
+    echo "还没有口令，先跑一次 ./setup.sh 配置好凭据。" >&2
+    exit 1
+  fi
+  if probe "$SWITCH_PORT" "$OLD_PW"; then
+    save "$SWITCH_PORT" "$OLD_PW"
+    echo "   （口令沿用，已切到该窗口）"
+    exit 0
+  fi
+  echo "端口 $SWITCH_PORT 探测不通过：窗口可能已经关了，或者那不是网关。" >&2
+  echo "用 ./setup.sh --list 看看现在有哪些窗口。" >&2
+  exit 1
+fi
+
+# ---------- --list：先看清有哪些窗口，再决定接哪个 ----------
+if [[ -n "$WANT_LIST" ]]; then
+  if [[ -z "$OLD_PW" ]]; then
+    echo "还没有口令，没法探测。先跑一次 ./setup.sh 配置好凭据。" >&2
+    exit 1
+  fi
+  list_gateways "$OLD_PW"
+  exit 0
+fi
 
 if [[ -n "$OLD_PW" ]]; then
   ROUNDS="${SETUP_ROUNDS:-6}"

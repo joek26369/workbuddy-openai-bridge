@@ -112,6 +112,30 @@ def _candidates_from_process():
     return out
 
 
+def _candidates_from_scan(known_pw):
+    """拿已有口令扫一遍本地监听端口。
+
+    为什么需要：WorkBuddy 每次重启，网关端口都会换（实测 52436 → 64654 →
+    62044 → 50397 → 61875），但口令不变。只依赖 .gateway.json 里的端口，
+    重启之后每个请求都会 502 Connection refused，而用户完全不知道为什么。
+    """
+    if not known_pw:
+        return []
+    ports = []
+    for line in _run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN"]).splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 9:
+            continue
+        name = parts[8]
+        if not name.startswith("127.0.0.1:"):
+            continue
+        try:
+            ports.append(int(name.rsplit(":", 1)[1]))
+        except ValueError:
+            pass
+    return [(p, known_pw) for p in sorted(set(ports))]
+
+
 def _existing_service(port, timeout=3):
     """端口被占用时看一眼是不是本服务已经在跑。"""
     try:
@@ -140,6 +164,10 @@ def _probe(port, pw, timeout=4):
     return False
 
 
+class _Unreachable(Exception):
+    """网关端口连不上（WorkBuddy 重启导致端口变化时触发）。"""
+
+
 class Gateway:
     def __init__(self):
         self.port = None
@@ -150,11 +178,20 @@ class Gateway:
         with self.lock:
             if self.port and not force:
                 return self.port, self.password
-            for port, pw in (_candidates_from_state() + _candidates_from_env()
-                             + _candidates_from_process()):
+            state = _candidates_from_state()
+            cands = state + _candidates_from_env() + _candidates_from_process()
+            for port, pw in cands:
                 if _probe(port, pw):
                     self.port, self.password = port, pw
                     print(f"[gateway] 命中 127.0.0.1:{port}", flush=True)
+                    return port, pw
+            # 全部落空：拿已知口令去扫监听端口（端口变了但口令没变的情况）
+            known_pw = state[0][1] if state else os.environ.get(
+                "CODEBUDDY_GATEWAY_PASSWORD", "").strip()
+            for port, pw in _candidates_from_scan(known_pw):
+                if _probe(port, pw, timeout=2):
+                    self.port, self.password = port, pw
+                    print(f"[gateway] 扫到新端口 127.0.0.1:{port}", flush=True)
                     return port, pw
             self.port = self.password = None
             return None, None
@@ -167,7 +204,28 @@ class Gateway:
         }
 
     def run(self, prompt, timeout=DEFAULT_TIMEOUT):
-        """提交一次 Agent 执行，返回 (最终文本, 元信息)。"""
+        """提交一次 Agent 执行，返回 (最终文本, 元信息)。
+
+        端口失效（WorkBuddy 重启后端口会变）时自动重扫并重试一次。
+        否则每个请求都是 502 Connection refused，而外部客户端只会显示
+        一句莫名其妙的报错，用户完全不知道是端口变了。
+        只在提交阶段就连不上时重试——已经拿到 runId 之后失败不重试，
+        避免同一条消息被提交两次、在对话里出现重复。
+        """
+        try:
+            return self._run_once(prompt, timeout)
+        except _Unreachable as e:
+            print(f"[gateway] 端口 {self.port} 连不上（{e}），重新扫描…", flush=True)
+            self.port = self.password = None
+            port, _ = self.discover(force=True)
+            if not port:
+                raise RuntimeError(
+                    "找不到已登录的 WorkBuddy 网关。请确认 WorkBuddy 桌面端正在运行，"
+                    "并且有打开的对话窗口。"
+                )
+            return self._run_once(prompt, timeout)
+
+    def _run_once(self, prompt, timeout):
         port, pw = self.discover()
         if not port:
             raise RuntimeError(
@@ -195,6 +253,9 @@ class Gateway:
                 d = json.loads(r.read().decode())
         except urllib.error.HTTPError as e:
             raise RuntimeError(f"网关拒绝请求: {e.code} {e.read()[:200].decode(errors='replace')}")
+        except urllib.error.URLError as e:
+            # 连接被拒 / 端口没人监听 —— 典型的“WorkBuddy 重启后端口变了”
+            raise _Unreachable(str(e.reason))
         run_id = (d.get("data") or {}).get("runId")
         if not run_id:
             raise RuntimeError(f"网关未返回 runId: {d}")
